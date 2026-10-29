@@ -1,0 +1,1 @@
+"""Synthetic QKD/KMS telemetry."""

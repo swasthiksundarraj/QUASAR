@@ -1,0 +1,29 @@
+{
+  "seed": 42,
+  "dataset": {
+    "name": "local-csv",
+    "path": "data/raw",
+    "label_column": "Label",
+    "sample_rows": 1200
+  },
+  "split": {
+    "train": 0.8,
+    "validation": 0.1,
+    "test": 0.1
+  },
+  "qatnet": {
+    "qubits": 4,
+    "vqc_layers": 1,
+    "pretrain_samples": 64,
+    "pretrain_epochs": 2,
+    "batch_size": 16,
+    "learning_rate": 0.01,
+    "tabnet_max_epochs": 10
+  },
+  "simulation": {
+    "interval_seconds": 1.0,
+    "key_pool_bits": 100000,
+    "seed": 42
+  }
+}
+

@@ -1,0 +1,1 @@
+"""QATNet model components."""
