@@ -3,9 +3,11 @@ import json
 import numpy as np
 import torch
 
+from qatnet.cli import _save_paper_qatnet_artifacts
 from qatnet.training import (
     PaperTabNetProfile,
     TabNetCandidate,
+    _recalibrate_batch_norm,
     run_paired_representation_comparison,
     run_paper_tabnet_workflow,
     select_paper_tabnet_candidate,
@@ -148,6 +150,31 @@ def test_paper_profile_rejects_virtual_batch_not_smaller_than_batch():
         assert "smaller" in str(exc)
     else:
         raise AssertionError("invalid virtual batch size should fail")
+
+
+def test_batch_norm_recalibration_uses_features_without_updating_parameters():
+    network = torch.nn.Sequential(torch.nn.BatchNorm1d(2))
+    network.eval()
+    initial_weight = network[0].weight.detach().clone()
+    initial_bias = network[0].bias.detach().clone()
+    features = np.array([
+        [2.0, 10.0],
+        [4.0, 14.0],
+        [6.0, 18.0],
+        [8.0, 22.0],
+    ], dtype=np.float32)
+
+    updated = _recalibrate_batch_norm(network, features, batch_size=4)
+
+    assert updated == 1
+    assert network.training is False
+    assert network[0].momentum == 0.1
+    torch.testing.assert_close(network[0].running_mean, torch.tensor([5.0, 16.0]))
+    torch.testing.assert_close(
+        network[0].running_var, torch.tensor([6.6666665, 26.666666])
+    )
+    torch.testing.assert_close(network[0].weight, initial_weight)
+    torch.testing.assert_close(network[0].bias, initial_bias)
 
 
 def test_paired_comparison_uses_identical_config_and_never_fits_on_test(tmp_path):
@@ -322,3 +349,44 @@ def test_three_way_representation_ablation_transforms_and_training_are_paired(tm
         assert (
             tmp_path / "three-way" / mode / "seed-101" / "classifier.joblib"
         ).is_file()
+
+
+def test_paper_qatnet_artifact_saving_records_frozen_encoder_and_train_only_pretraining(
+    tmp_path,
+):
+    class EncoderFixture:
+        qubits = 4
+        layers = 1
+        torch = torch
+
+        def __init__(self):
+            self.quantum_layer = torch.nn.Linear(16, 16)
+            for parameter in self.quantum_layer.parameters():
+                parameter.requires_grad_(False)
+            self.quantum_layer.eval()
+            self.probe = torch.nn.Linear(16, 5)
+
+    run_dir = tmp_path / "qatnet-run"
+    run_dir.mkdir()
+    encoder = EncoderFixture()
+    _save_paper_qatnet_artifacts(
+        run_dir,
+        encoder,
+        [1.2, 0.8, 0.5],
+        ("Benign", "Bot", "DoS-Hulk", "FTP-BruteForce", "Infiltration"),
+        np.array([0] * 8 + [1] * 8 + [2] * 8 + [3] * 8 + [4] * 8),
+        pretraining_train_rows=4000,
+        preprocessor={"fitted_on": "train"},
+    )
+
+    metadata = json.loads((run_dir / "qatnet-pretraining.json").read_text())
+    assert metadata["pretraining_partition"] == "training rows only"
+    assert metadata["pretraining_input_rows"] == 4000
+    assert metadata["balanced_subset_rows"] == 40
+    assert metadata["training_class_counts"]["Benign"] == 8
+    assert metadata["epoch_losses"] == [1.2, 0.8, 0.5]
+    assert metadata["quantum_parameters_frozen_after_pretraining"] is True
+    assert metadata["preprocessor_checkpoint"] == "preprocessor.joblib"
+    assert (run_dir / "qatnet" / "quantum_encoder.pt").is_file()
+    assert (run_dir / "qatnet" / "pretraining_probe.pt").is_file()
+    assert (run_dir / "preprocessor.joblib").is_file()

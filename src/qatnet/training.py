@@ -213,6 +213,48 @@ def _new_paper_tabnet(seed: int, candidate: TabNetCandidate, profile: PaperTabNe
     )
 
 
+def _recalibrate_batch_norm(
+    network: torch.nn.Module,
+    features: np.ndarray,
+    batch_size: int,
+) -> int:
+    """Re-estimate inference BatchNorm buffers from the refit feature rows."""
+    values = np.asarray(features, dtype=np.float32)
+    if values.ndim != 2 or len(values) == 0:
+        raise ValueError("BatchNorm recalibration requires non-empty 2D features")
+    if batch_size < 1:
+        raise ValueError("BatchNorm recalibration batch_size must be positive")
+    batch_norms = [
+        module for module in network.modules()
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+        and module.track_running_stats
+    ]
+    if not batch_norms:
+        return 0
+
+    original_momenta = [module.momentum for module in batch_norms]
+    device = next(network.parameters()).device
+    for module in batch_norms:
+        module.reset_running_stats()
+        module.momentum = None
+
+    network.train()
+    try:
+        with torch.no_grad():
+            for start in range(0, len(values), batch_size):
+                batch = torch.as_tensor(
+                    values[start : start + batch_size],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                network(batch)
+    finally:
+        for module, momentum in zip(batch_norms, original_momenta):
+            module.momentum = momentum
+        network.eval()
+    return len(batch_norms)
+
+
 def _fit_paper_candidate(
     model: Any,
     x_train: np.ndarray,
@@ -350,6 +392,13 @@ def run_paper_tabnet_workflow(
             num_workers=0,
             drop_last=False,
         )
+        recalibrated_batch_norm_layers = 0
+        if feature_pipeline == "qatnet":
+            recalibrated_batch_norm_layers = _recalibrate_batch_norm(
+                model.network,
+                combined_x,
+                batch_size=profile.batch_size,
+            )
         started = time.perf_counter()
         probabilities = np.asarray(model.predict_proba(np.asarray(x_test, dtype=np.float32)))
         inference_seconds_per_sample = (
@@ -372,6 +421,7 @@ def run_paper_tabnet_workflow(
             "selected_validation_macro_f1": selected["validation_macro_f1"],
             "refit_epochs": refit_epochs,
             "training_class_weights": selected["class_weights"],
+            "batch_norm_recalibrated_layers": recalibrated_batch_norm_layers,
             "metrics": metrics,
             "inference_seconds_per_sample": inference_seconds_per_sample,
         }
@@ -428,6 +478,10 @@ def run_paper_tabnet_workflow(
             "training_rows": len(combined_y),
             "epochs": refit_epochs,
             "class_weight_source": "original training partition only",
+            "qatnet_batch_norm_calibration": (
+                "Running statistics are recalibrated with unlabeled train+validation "
+                "refit features after final fitting and before test inference."
+            ) if feature_pipeline == "qatnet" else None,
             "assumption": (
                 "The PDF says retrain on train+validation after selection but does not "
                 "specify refit epoch handling. The selected candidate's best epoch from "

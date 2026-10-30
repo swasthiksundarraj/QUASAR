@@ -9,7 +9,9 @@ import logging
 from pathlib import Path
 import platform
 import time
+from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -344,17 +346,23 @@ def paper_tabnet(args: argparse.Namespace) -> None:
         seed=args.split_seed,
     )
     split_features = (splits.x_train, splits.x_validation, splits.x_test)
+    qatnet_artifacts = None
     if args.mode == "amplitude":
         split_features = tuple(map(amplitude_probability_features, split_features))
     elif args.mode == "qatnet":
         encoder = VariationalQuantumEncoder(args.qubits, layers=1, seed=101)
-        encoder.pretrain(
+        pretraining_losses = encoder.pretrain(
             splits.x_train,
             splits.y_train,
             epochs=15,
             batch_size=256,
             seed=101,
         )
+        qatnet_artifacts = {
+            "encoder": encoder,
+            "pretraining_losses": pretraining_losses,
+            "pretraining_train_rows": len(splits.y_train),
+        }
         split_features = tuple(encoder.transform(values) for values in split_features)
 
     report = run_paper_tabnet_workflow(
@@ -374,15 +382,40 @@ def paper_tabnet(args: argparse.Namespace) -> None:
     (output / "data-split.json").write_text(json.dumps({
         "dataset": args.dataset_name,
         "source_csv": str(source),
+        "source_csv_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "split_seed": args.split_seed,
         "class_names": list(splits.class_names),
         "split_class_counts": splits.split_class_counts,
+        "rows": {
+            "train": len(splits.y_train),
+            "validation": len(splits.y_validation),
+            "test": len(splits.y_test),
+        },
         "feature_names": list(splits.feature_names),
         "excluded_identifiers": list(splits.report.dropped_identifiers),
         "pca_components_requested": 2**args.qubits,
         "pca_components_fitted": splits.preprocessor.component_count,
         "preprocessing_fit_partition": "train only",
+        "train_feature_label_sha256": _partition_fingerprint(splits.x_train, splits.y_train),
+        "validation_feature_label_sha256": _partition_fingerprint(
+            splits.x_validation, splits.y_validation
+        ),
+        "test_feature_label_sha256": _partition_fingerprint(splits.x_test, splits.y_test),
     }, indent=2) + "\n")
+    if qatnet_artifacts is not None:
+        _save_paper_qatnet_artifacts(
+            output,
+            qatnet_artifacts["encoder"],
+            qatnet_artifacts["pretraining_losses"],
+            splits.class_names,
+            splits.y_train,
+            qatnet_artifacts["pretraining_train_rows"],
+            splits.preprocessor,
+        )
+        summary_path = output / "summary.json"
+        summary = json.loads(summary_path.read_text())
+        summary["qatnet_pretraining_artifacts"] = "qatnet-pretraining.json"
+        summary_path.write_text(json.dumps(summary, indent=2, default=float) + "\n")
     logger.info(
         "Paper-profile TabNet workflow complete for %s / %s; summary: %s",
         report["dataset"], report["feature_pipeline"], output / "summary.json",
@@ -451,6 +484,62 @@ def paired_tabnet(args: argparse.Namespace) -> None:
     logger.info(
         "Paired fixed-TabNet comparison complete; summary: %s",
         output / "summary.json",
+    )
+
+
+def _save_paper_qatnet_artifacts(
+    output: Path,
+    encoder: VariationalQuantumEncoder,
+    pretraining_losses: list[float],
+    class_names: tuple[str, ...],
+    y_train: np.ndarray,
+    pretraining_train_rows: int,
+    preprocessor: Any,
+) -> None:
+    if any(parameter.requires_grad for parameter in encoder.quantum_layer.parameters()):
+        raise RuntimeError("QATNet quantum parameters must be frozen before classifier fitting")
+    if encoder.quantum_layer.training:
+        raise RuntimeError("QATNet quantum layer must be in evaluation mode after pretraining")
+    artifact_dir = output / "qatnet"
+    artifact_dir.mkdir(exist_ok=False)
+    joblib.dump(preprocessor, output / "preprocessor.joblib")
+    encoder_path = artifact_dir / "quantum_encoder.pt"
+    encoder.torch.save(encoder.quantum_layer.state_dict(), encoder_path)
+    probe_path = artifact_dir / "pretraining_probe.pt"
+    if encoder.probe is None:
+        raise RuntimeError("QATNet pretraining probe is missing")
+    encoder.torch.save(encoder.probe.state_dict(), probe_path)
+    class_counts = {
+        class_name: int(np.count_nonzero(np.asarray(y_train) == index))
+        for index, class_name in enumerate(class_names)
+    }
+    balanced_count = min(class_counts.values())
+    metadata = {
+        "encoder_checkpoint": str(encoder_path.relative_to(output)),
+        "pretraining_probe_checkpoint": str(probe_path.relative_to(output)),
+        "preprocessor_checkpoint": "preprocessor.joblib",
+        "qubits": encoder.qubits,
+        "layers": encoder.layers,
+        "quantum_device": "PennyLane default.qubit (CPU)",
+        "feature_output": "computational-basis probabilities",
+        "input_feature_transform": "row-wise L2 normalization of signed PCA coordinates",
+        "pretraining_objective": "supervised cross-entropy through a trainable linear probe",
+        "optimizer": "Adam",
+        "learning_rate": 0.01,
+        "epochs": len(pretraining_losses),
+        "batch_size": 256,
+        "seed": 101,
+        "pretraining_partition": "training rows only",
+        "pretraining_input_rows": int(pretraining_train_rows),
+        "training_class_counts": class_counts,
+        "balanced_subset_rows": int(balanced_count * len(class_names)),
+        "balanced_subset_sampling": "without replacement; minimum training-class count per class",
+        "quantum_parameters_frozen_after_pretraining": True,
+        "quantum_layer_eval_mode_after_pretraining": True,
+        "epoch_losses": [float(value) for value in pretraining_losses],
+    }
+    (output / "qatnet-pretraining.json").write_text(
+        json.dumps(metadata, indent=2) + "\n"
     )
 
 
